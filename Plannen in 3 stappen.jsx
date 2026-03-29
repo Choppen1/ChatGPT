@@ -3,31 +3,13 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 let XLSX: any = null;
 try { XLSX = require("xlsx"); } catch { /* optioneel */ }
 
-// Kleine helpers
-const DAYS = ["ma", "di", "wo", "do", "vr", "za", "zo"] as const;
-const DAY_LABEL: Record<typeof DAYS[number], string> = {
-  ma: "maandag", di: "dinsdag", wo: "woensdag", do: "donderdag", vr: "vrijdag", za: "zaterdag", zo: "zondag"
-};
-
-function uid(prefix = "id") { return `${prefix}_${Math.random().toString(36).slice(2, 9)}`; }
-function clamp(n:number, a:number, b:number){ return Math.max(a, Math.min(b, n)); }
-function toHHMM(n: number){ return `${String(n).padStart(2,"0")}:00`; }
-
-// Types
-type Category = { id: string; naam: string; kleur: string; context: "thuis"|"stage"|"school"|"overig" };
-
-type Task = {
-  id: string;
-  titel: string;
-  minuten: number; // duur
-  deadline?: string; // ISO date
-  context: "thuis"|"stage"|"school"|"overig";
-  io?: string; // IO-code of opdrachtlabel
-  prioriteit: 1|2|3; // 1 = laag, 3 = hoog
-  status: "open"|"gepland"|"gedeeltelijk"|"klaar";
-};
-
-type Placed = { taskId: string; day: typeof DAYS[number]; hour: number; span: number };
+// Geëxtraheerde modules (testbaar)
+import { DAYS, DAY_LABEL, type Category, type Task, type Placed, type Grid, type Day } from "./src/types";
+import { uid, clamp, toHHMM } from "./src/utils";
+import { autoSchedule as runAutoSchedule } from "./src/scheduler";
+import { generateICSContent } from "./src/export-ics";
+import { generateTasksCSV } from "./src/export-csv";
+import { mapRowsToTasks } from "./src/import-wizard";
 
 // LocalStorage hooks
 function useLocalState<T>(key: string, init: T){
@@ -60,7 +42,6 @@ export default function PlanningApp(){
   const [activeCat, setActiveCat] = useLocalState<string| null>("plan.activeCat", null);
 
   // Rooster: mapping day->hour->catId | null
-  type Grid = Record<typeof DAYS[number], Record<number, string|null>>;
   const emptyGrid: Grid = useMemo(()=>{
     const g: any = {}; DAYS.forEach(d => { g[d] = {}; hours.forEach(h => g[d][h] = null); }); return g;
   }, [hours]);
@@ -118,93 +99,9 @@ export default function PlanningApp(){
 
   // Autoscheduler: plan taken in uren die bij de context passen (bijv. 'huiswerk' uit stap 1)
   function autoSchedule(){
-    // Helper: vind category object bij id
-    const catById = (id: string|null|undefined) => cats.find(c => c.id === id);
-
-    // Maak een lijst van alle rooster-cellen
-    type Cell = { day: typeof DAYS[number]; hour: number; cat: Category|undefined; catId: string|null };
-    const cells: Cell[] = [];
-    DAYS.forEach(d => hours.forEach(h => {
-      const cid = grid[d][h];
-      cells.push({ day: d, hour: h, catId: cid, cat: catById(cid||undefined) });
-    }));
-
-    // Houd bij welke cellen al gebruikt zijn door deze planner-run
-    const used = new Set<string>();
-    const k = (d: typeof DAYS[number], h: number) => `${d}-${h}`;
-
-    // Sorteer taken: prio desc, deadline asc, duur desc
-    const open = tasks.filter(t => t.status !== "klaar").slice().sort((a,b)=>{
-      if(b.prioriteit!==a.prioriteit) return b.prioriteit - a.prioriteit;
-      const da = a.deadline ? new Date(a.deadline).getTime() : Infinity;
-      const db = b.deadline ? new Date(b.deadline).getTime() : Infinity;
-      if(da!==db) return da - db;
-      return b.minuten - a.minuten;
-    });
-
-    const placements: Placed[] = [];
-
-    function allowedForTask(t: Task, c?: Category){
-      if(!c) return false;
-      const nm = c.naam.toLowerCase();
-      if(nm.includes("slaap")) return false;
-      // Strikt: huiswerk alleen in blokken 'huiswerk'; stage alleen in 'stage'
-      if(t.context === "thuis") return nm.includes("huiswerk");
-      if(t.context === "stage") return nm.includes("stage");
-      if(t.context === "school") return nm.includes("school") || nm.includes("les");
-      // overig → vrij/overig
-      return nm.includes("vrij") || c.context === "overig";
-    }
-
-    function slotsForTask(t: Task){
-      const primary = cells.filter(c => allowedForTask(t, c.cat));
-      const sortWeek = (arr: Cell[]) => arr.slice().sort((a,b)=>{
-        const da = DAYS.indexOf(a.day), db = DAYS.indexOf(b.day);
-        if(da !== db) return da - db; return a.hour - b.hour;
-      });
-      if(t.context === "thuis" || t.context === "stage"){
-        return sortWeek(primary);
-      }
-      const vrijCat = cats.find(c => c.naam.toLowerCase().includes("vrij"));
-      const secondary = vrijCat ? cells.filter(c => c.catId === vrijCat.id) : [];
-      const empty = cells.filter(c => !c.catId);
-      const seen = new Set<string>();
-      const combined = [...primary, ...secondary, ...empty].filter(c => {
-        const kk = k(c.day, c.hour); if(seen.has(kk)) return false; seen.add(kk); return true;
-      });
-      return sortWeek(combined);
-    }
-
-    for(const t of open){
-      const need = Math.ceil(t.minuten/60);
-      const slots = slotsForTask(t).filter(c => !used.has(k(c.day, c.hour)));
-      let remaining = need;
-      let placedForThis = 0;
-      let idx = 0;
-      while(remaining > 0 && idx < slots.length){
-        const start = slots[idx];
-        // Zoek aaneengesloten blok op dezelfde dag binnen de beschikbare slots
-        let span = 1;
-        while(span < remaining){
-          const nextCell = slots.find(c => c.day === start.day && c.hour === start.hour + span && !used.has(k(c.day,c.hour)));
-          if(!nextCell) break;
-          span++;
-        }
-        for(let s=0; s<span; s++) used.add(k(start.day, start.hour + s));
-        placements.push({ taskId: t.id, day: start.day, hour: start.hour, span });
-        placedForThis += span;
-        remaining -= span;
-        // Spring naar het eerstvolgende ongebruikte slot
-        while(idx < slots.length && used.has(k(slots[idx].day, slots[idx].hour))) idx++;
-      }
-      t.status = placedForThis >= need ? "gepland" : (placedForThis > 0 ? "gedeeltelijk" : t.status);
-    }
-
+    const { placements, updatedTasks } = runAutoSchedule(tasks, cats, grid, hours);
     setPlaced(placements);
-    setTasks(prev => prev.map(tt => {
-      const src = open.find(o => o.id === tt.id);
-      return src ? { ...tt, status: src.status } : tt;
-    }));
+    setTasks(updatedTasks);
     setStep(3);
   }
 
@@ -214,52 +111,8 @@ export default function PlanningApp(){
       alert("Geen geplande items om te exporteren.");
       return;
     }
-    const now = new Date();
-    const TZ = "Europe/Amsterdam"; // informatief; export is in UTC (Z)
-    const toUTCStamp = (d: Date) => d.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
-
-    const lines: string[] = [
-      "BEGIN:VCALENDAR",
-      "VERSION:2.0",
-      "CALSCALE:GREGORIAN",
-      "METHOD:PUBLISH",
-      "PRODID:-//ROC Planner//NL",
-      "X-WR-CALNAME:ROC Planner",
-      `X-WR-TIMEZONE:${TZ}`,
-    ];
-
-    placed.forEach(p => {
-      const t = tasks.find(x => x.id===p.taskId); if(!t) return;
-      const jsDow = now.getDay(); // 0=zo..6=za
-      const todayMonIdx = jsDow === 0 ? 6 : jsDow - 1; // 0=ma..6=zo
-      const targetIdx = DAYS.indexOf(p.day);
-      const delta = ((targetIdx - todayMonIdx) + 7) % 7;
-      const start = new Date(now);
-      start.setDate(now.getDate() + delta);
-      start.setHours(p.hour, 0, 0, 0);
-      const end = new Date(start); end.setHours(start.getHours() + p.span);
-
-      // Gebruik RegExp-constructors zodat er nooit per ongeluk echte newlines in het patroon staan
-      const summary = (t.titel || "Taak")
-        .replace(new RegExp("[\r\n,;]+","g"), " ")
-        .slice(0, 120);
-      const desc = (`Context: ${t.context}${t.io? " | IO/Opdracht: "+t.io: ""}`)
-        .replace(new RegExp("[\r\n]+","g"), " ");
-
-      lines.push(
-        "BEGIN:VEVENT",
-        `UID:${uid("evt")}`,
-        `DTSTAMP:${toUTCStamp(now)}`,
-        `DTSTART:${toUTCStamp(start)}`,
-        `DTEND:${toUTCStamp(end)}`,
-        `SUMMARY:${summary}`,
-        `DESCRIPTION:${desc}`,
-        "END:VEVENT"
-      );
-    });
-
-    lines.push("END:VCALENDAR");
-    const blob = new Blob([lines.join("\r\n") + "\r\n"], { type: "text/calendar;charset=utf-8" });
+    const content = generateICSContent(placed, tasks);
+    const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -271,9 +124,8 @@ export default function PlanningApp(){
 
   // CSV export van taken
   function exportTasksCSV(){
-    const header = ["titel","minuten","deadline","context","io","prioriteit","status\n"].join(",");
-    const rows = tasks.map(t => [t.titel, t.minuten, t.deadline||"", t.context, t.io||"", t.prioriteit, t.status].join(","));
-    const blob = new Blob([header + rows.join("\n")], { type: "text/csv;charset=utf-8"});
+    const content = generateTasksCSV(tasks);
+    const blob = new Blob([content], { type: "text/csv;charset=utf-8"});
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "taken.csv"; a.click();
   }
 
@@ -314,28 +166,13 @@ export default function PlanningApp(){
 
   function mapImportToTasks(){
     if(!importPreview) return;
-    // slimme mapping: zoek naar kolomnamen die vaak voorkomen in je sjablonen
-    const H = importPreview.headers.map(h => h.toLowerCase());
-    const idx = (name: string) => H.findIndex(h => h.includes(name));
-    const iTitel = [idx("titel"), idx("taak"), idx("opdracht"), idx("io")].find(i => i>=0) ?? 0;
-    const iMin   = [idx("min"), idx("duur"), idx("uren")].find(i => i>=0) ?? -1;
-    const iDDL   = [idx("deadline"), idx("datum"), idx("oplever")].find(i => i>=0) ?? -1;
-    const iCtx   = [idx("context"), idx("thuis"), idx("roc"), idx("stage")].find(i => i>=0) ?? -1;
-    const iIO    = [idx("io"), idx("opdracht"), idx("code")].find(i => i>=0) ?? -1;
-
-    const nieuw: Task[] = importPreview.rows.map((r, rowIdx) => ({
-      id: uid("t"),
-      titel: String(r[iTitel] ?? `Taak ${rowIdx+1}`),
-      minuten: Math.round(Number(r[iMin] ?? 60)) || 60,
-      deadline: iDDL>=0 && r[iDDL] ? new Date(r[iDDL]).toISOString().slice(0,10) : undefined,
-      context: ((): Task["context"] => {
-        const v = String(r[iCtx] ?? "").toLowerCase();
-        if(v.includes("stage")) return "stage"; if(v.includes("school")||v.includes("roc")) return "school"; if(v.includes("thuis")) return "thuis"; return "overig";
-      })(),
-      io: iIO>=0 ? String(r[iIO]) : undefined,
-      prioriteit: 2,
-      status: "open",
-    }));
+    // Bouw keyed rows van de array-rows
+    const keyedRows = importPreview.rows.map(r => {
+      const obj: Record<string, unknown> = {};
+      importPreview.headers.forEach((h, i) => { obj[h || `kolom_${i+1}`] = (r as any)[i]; });
+      return obj;
+    });
+    const nieuw = mapRowsToTasks(importPreview.headers, keyedRows);
     setTasks(prev => [...prev, ...nieuw]);
     setImportPreview(null);
     if(fileRef.current) fileRef.current.value = "";
